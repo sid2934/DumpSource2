@@ -515,7 +515,12 @@ ojson BuildSyntheticDefs()
 		SYNTHETIC_FIELD(::Vector, y, SyntheticFloat()),
 		SYNTHETIC_FIELD(::Vector, z, SyntheticFloat()),
 	});
-	defs["VectorAligned"] = SyntheticObject<::VectorAligned>("VectorAligned", "16-byte-aligned 3D vector (memory layout: Vector + 4-byte padding).", {
+	// VectorAligned intentionally exposes only x/y/z. The SDK class also has
+	// a fourth `w` slot the engine uses opportunistically as scratch space,
+	// but it isn't part of the documented 3D-vector contract — treat as a
+	// Vector with alignment + padding. (Vector4DAligned is the proper 4D
+	// aligned variant.)
+	defs["VectorAligned"] = SyntheticObject<::VectorAligned>("VectorAligned", "16-byte-aligned 3D vector. Schema exposes only x/y/z; the SDK class includes a hidden 4th slot used opportunistically by the engine.", {
 		SYNTHETIC_FIELD(::VectorAligned, x, SyntheticFloat()),
 		SYNTHETIC_FIELD(::VectorAligned, y, SyntheticFloat()),
 		SYNTHETIC_FIELD(::VectorAligned, z, SyntheticFloat()),
@@ -530,6 +535,12 @@ ojson BuildSyntheticDefs()
 		SYNTHETIC_FIELD(::Vector4D, z, SyntheticFloat()),
 		SYNTHETIC_FIELD(::Vector4D, w, SyntheticFloat()),
 	});
+	defs["Vector4DAligned"] = SyntheticObject<::Vector4DAligned>("Vector4DAligned", "16-byte-aligned 4D vector.", {
+		SYNTHETIC_FIELD(::Vector4DAligned, x, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector4DAligned, y, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector4DAligned, z, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector4DAligned, w, SyntheticFloat()),
+	});
 	defs["QAngle"] = SyntheticObject<::QAngle>("QAngle", "Euler angles, in degrees. SDK members x/y/z surfaced as pitch/yaw/roll.", {
 		SYNTHETIC_FIELD_AS(::QAngle, x, "pitch", SyntheticFloat()),
 		SYNTHETIC_FIELD_AS(::QAngle, y, "yaw", SyntheticFloat()),
@@ -540,6 +551,12 @@ ojson BuildSyntheticDefs()
 		SYNTHETIC_FIELD(::Quaternion, y, SyntheticFloat()),
 		SYNTHETIC_FIELD(::Quaternion, z, SyntheticFloat()),
 		SYNTHETIC_FIELD(::Quaternion, w, SyntheticFloat()),
+	});
+	defs["QuaternionAligned"] = SyntheticObject<::QuaternionAligned>("QuaternionAligned", "16-byte-aligned unit quaternion.", {
+		SYNTHETIC_FIELD(::QuaternionAligned, x, SyntheticFloat()),
+		SYNTHETIC_FIELD(::QuaternionAligned, y, SyntheticFloat()),
+		SYNTHETIC_FIELD(::QuaternionAligned, z, SyntheticFloat()),
+		SYNTHETIC_FIELD(::QuaternionAligned, w, SyntheticFloat()),
 	});
 
 	// Color stores 4 channels as `unsigned char _color[4]` (private member),
@@ -577,7 +594,7 @@ ojson BuildSyntheticDefs()
 
 	defs["CTransform"] = SyntheticObject<::CTransform>("CTransform", "Position + rotation transform. SDK members m_vPosition/m_orientation surfaced as position/rotation.", {
 		SYNTHETIC_FIELD_AS(::CTransform, m_vPosition, "position", SerializeRef("VectorAligned")),
-		SYNTHETIC_FIELD_AS(::CTransform, m_orientation, "rotation", SerializeRef("Quaternion")),
+		SYNTHETIC_FIELD_AS(::CTransform, m_orientation, "rotation", SerializeRef("QuaternionAligned")),
 	});
 	defs["AABB_t"] = SyntheticObject<::AABB_t>("AABB_t", "Axis-aligned bounding box. SDK members m_vMinBounds/m_vMaxBounds surfaced as mins/maxs.", {
 		SYNTHETIC_FIELD_AS(::AABB_t, m_vMinBounds, "mins", SerializeRef("Vector")),
