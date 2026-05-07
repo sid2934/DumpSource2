@@ -20,17 +20,32 @@
 #include "json_schema_exporter.h"
 #include "globalvariables.h"
 #include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
+
+// HL2SDK math headers used for sizeof / offsetof on the synthetic catalogue.
+// These types aren't reflected by CSchemaSystem (so we have to inject them
+// into $defs ourselves), but their C++ definitions ARE reachable from here
+// because we already link against the HL2SDK — so we can pull layout numbers
+// from the actual ABI rather than hardcoding them.
+#include "mathlib/vector.h"
+#include "mathlib/vector2d.h"
+#include "mathlib/vector4d.h"
+#include "mathlib/mathlib.h"
+#include "mathlib/transform.h"
+#include "mathlib/camera.h"
+#include "Color.h"
 
 using ojson = nlohmann::ordered_json;
 
@@ -363,11 +378,14 @@ ojson SerializeType(CSchemaType* type)
 // ones up front; reflected classes of the same name overwrite the
 // synthetic entry.
 //
-// Field shapes are hardcoded because the HL2SDK doesn't provide any
-// programmatic means to extract ("x", "y", "z") from
-// `class Vector { float x, y, z; }` at compile time without C++
-// reflection. sizeof/offsetof would give us layout numbers but those
-// aren't part of the synthetic shape we emit.
+// Layout numbers (size + per-field offset) are pulled from the HL2SDK
+// via sizeof / offsetof rather than hardcoded — this keeps them
+// ABI-correct for the build target. Field NAMES still come from the
+// schema-author's hand (true compile-time member-name reflection isn't
+// available until C++26), and where the SDK member name differs from
+// the schema name (e.g. QAngle exposes x/y/z which we surface as
+// pitch/yaw/roll), the SYNTHETIC_FIELD_AS macro lets us rename for
+// the JSON output while still pulling offsetof from the real member.
 
 ojson SyntheticFloat()
 {
@@ -385,7 +403,60 @@ ojson SyntheticUint8()
 	return j;
 }
 
-ojson SyntheticObject(const char* title, const char* description, std::initializer_list<std::pair<const char*, ojson>> fields)
+struct SyntheticField
+{
+	const char* name;
+	std::size_t offset;
+	ojson schema;
+};
+
+template <typename T>
+ojson SyntheticObject(const char* title, const char* description, std::initializer_list<SyntheticField> fields)
+{
+	// offsetof on non-standard-layout types is conditionally-supported per the
+	// C++ standard but reliably works on GCC/Clang/MSVC via __builtin_offsetof.
+	// Some HL2SDK math types (VectorAligned, CTransform) aren't standard-layout
+	// because they add data members on top of inherited ones — we accept that
+	// rather than error out, since the offsets we get are correct in practice.
+	ojson def;
+	def["type"] = "object";
+	def["title"] = title;
+	def["description"] = description;
+	def[Ext("size")] = sizeof(T);
+
+	ojson props = ojson::object();
+	ojson required = ojson::array();
+	for (const auto& f : fields)
+	{
+		ojson schema = f.schema;
+		schema[Ext("offset")] = f.offset;
+		props[f.name] = std::move(schema);
+		required.push_back(f.name);
+	}
+	def["properties"] = std::move(props);
+	def["required"] = std::move(required);
+	def[Ext("synthetic")] = true;
+	return def;
+}
+
+template <typename T>
+ojson SyntheticFloatArray(const char* title, const char* description, int count)
+{
+	ojson def;
+	def["type"] = "array";
+	def["title"] = title;
+	def["description"] = description;
+	def["items"] = SyntheticFloat();
+	def["minItems"] = count;
+	def["maxItems"] = count;
+	def[Ext("size")] = sizeof(T);
+	def[Ext("synthetic")] = true;
+	return def;
+}
+
+// Layout-free fallbacks for synthetics whose SDK type isn't reachable
+// (Color32 and matrix4x4_t are not declared by those names in HL2SDK).
+ojson SyntheticObjectHardcoded(const char* title, const char* description, std::initializer_list<std::pair<const char*, ojson>> fields)
 {
 	ojson def;
 	def["type"] = "object";
@@ -404,7 +475,7 @@ ojson SyntheticObject(const char* title, const char* description, std::initializ
 	return def;
 }
 
-ojson SyntheticFloatArray(const char* title, const char* description, int count)
+ojson SyntheticFloatArrayHardcoded(const char* title, const char* description, int count)
 {
 	ojson def;
 	def["type"] = "array";
@@ -417,37 +488,117 @@ ojson SyntheticFloatArray(const char* title, const char* description, int count)
 	return def;
 }
 
+#define SYNTHETIC_FIELD(StructT, member, schema) \
+	SyntheticField { #member, offsetof(StructT, member), schema }
+
+// Same as SYNTHETIC_FIELD but emits the schema property under a friendlier
+// name. Used where the SDK member identifier differs from the documented
+// JSON shape (QAngle's x/y/z surfaced as pitch/yaw/roll, etc.).
+#define SYNTHETIC_FIELD_AS(StructT, member, jsonName, schema) \
+	SyntheticField { jsonName, offsetof(StructT, member), schema }
+
+// VectorAligned and CTransform aren't standard-layout (each adds data members
+// on top of an inheriting base), so offsetof emits -Winvalid-offsetof on
+// GCC/Clang. Suppress for the synthetic catalogue specifically — the offsets
+// it returns are correct in practice, which is why it's compiler-supported.
+#if defined(__clang__) || defined(__GNUC__)
+#	pragma GCC diagnostic push
+#	pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+
 ojson BuildSyntheticDefs()
 {
 	ojson defs = ojson::object();
 
-	defs["Vector"] = SyntheticObject("Vector", "3D vector.",
-		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}, {"z", SyntheticFloat()}});
-	defs["VectorAligned"] = SyntheticObject("VectorAligned", "16-byte-aligned 3D vector (memory layout: Vector + padding).",
-		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}, {"z", SyntheticFloat()}});
-	defs["Vector2D"] = SyntheticObject("Vector2D", "2D vector.",
-		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}});
-	defs["Vector4D"] = SyntheticObject("Vector4D", "4D vector.",
-		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}, {"z", SyntheticFloat()}, {"w", SyntheticFloat()}});
-	defs["QAngle"] = SyntheticObject("QAngle", "Euler angles (pitch, yaw, roll), in degrees.",
-		{{"pitch", SyntheticFloat()}, {"yaw", SyntheticFloat()}, {"roll", SyntheticFloat()}});
-	defs["Quaternion"] = SyntheticObject("Quaternion", "Unit quaternion.",
-		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}, {"z", SyntheticFloat()}, {"w", SyntheticFloat()}});
-	defs["Color"] = SyntheticObject("Color", "RGBA color, 8 bits per channel.",
-		{{"r", SyntheticUint8()}, {"g", SyntheticUint8()}, {"b", SyntheticUint8()}, {"a", SyntheticUint8()}});
-	defs["Color32"] = SyntheticObject("Color32", "Packed 32-bit RGBA color.",
-		{{"r", SyntheticUint8()}, {"g", SyntheticUint8()}, {"b", SyntheticUint8()}, {"a", SyntheticUint8()}});
-	defs["CTransform"] = SyntheticObject("CTransform", "Position + rotation transform.",
-		{{"position", SerializeRef("VectorAligned")}, {"rotation", SerializeRef("Quaternion")}});
-	defs["AABB_t"] = SyntheticObject("AABB_t", "Axis-aligned bounding box.",
-		{{"mins", SerializeRef("Vector")}, {"maxs", SerializeRef("Vector")}});
+	defs["Vector"] = SyntheticObject<::Vector>("Vector", "3D vector.", {
+		SYNTHETIC_FIELD(::Vector, x, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector, y, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector, z, SyntheticFloat()),
+	});
+	defs["VectorAligned"] = SyntheticObject<::VectorAligned>("VectorAligned", "16-byte-aligned 3D vector (memory layout: Vector + 4-byte padding).", {
+		SYNTHETIC_FIELD(::VectorAligned, x, SyntheticFloat()),
+		SYNTHETIC_FIELD(::VectorAligned, y, SyntheticFloat()),
+		SYNTHETIC_FIELD(::VectorAligned, z, SyntheticFloat()),
+	});
+	defs["Vector2D"] = SyntheticObject<::Vector2D>("Vector2D", "2D vector.", {
+		SYNTHETIC_FIELD(::Vector2D, x, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector2D, y, SyntheticFloat()),
+	});
+	defs["Vector4D"] = SyntheticObject<::Vector4D>("Vector4D", "4D vector.", {
+		SYNTHETIC_FIELD(::Vector4D, x, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector4D, y, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector4D, z, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Vector4D, w, SyntheticFloat()),
+	});
+	defs["QAngle"] = SyntheticObject<::QAngle>("QAngle", "Euler angles, in degrees. SDK members x/y/z surfaced as pitch/yaw/roll.", {
+		SYNTHETIC_FIELD_AS(::QAngle, x, "pitch", SyntheticFloat()),
+		SYNTHETIC_FIELD_AS(::QAngle, y, "yaw", SyntheticFloat()),
+		SYNTHETIC_FIELD_AS(::QAngle, z, "roll", SyntheticFloat()),
+	});
+	defs["Quaternion"] = SyntheticObject<::Quaternion>("Quaternion", "Unit quaternion.", {
+		SYNTHETIC_FIELD(::Quaternion, x, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Quaternion, y, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Quaternion, z, SyntheticFloat()),
+		SYNTHETIC_FIELD(::Quaternion, w, SyntheticFloat()),
+	});
 
-	defs["matrix3x4_t"] = SyntheticFloatArray("matrix3x4_t", "3x4 transform matrix (row-major, 12 floats).", 12);
-	defs["matrix3x4a_t"] = SyntheticFloatArray("matrix3x4a_t", "16-byte-aligned 3x4 transform matrix (row-major, 12 floats).", 12);
-	defs["matrix4x4_t"] = SyntheticFloatArray("matrix4x4_t", "4x4 transform matrix (row-major, 16 floats).", 16);
+	// Color stores 4 channels as `unsigned char _color[4]` (private member),
+	// so we can't take offsetof on _color from outside. The bytes are at
+	// offsets 0..3 of the class itself since _color is the only data member.
+	{
+		ojson def;
+		def["type"] = "object";
+		def["title"] = "Color";
+		def["description"] = "RGBA color, 8 bits per channel.";
+		def[Ext("size")] = sizeof(::Color);
+		ojson props = ojson::object();
+		ojson required = ojson::array();
+		const char* names[] = {"r", "g", "b", "a"};
+		for (std::size_t i = 0; i < 4; ++i)
+		{
+			ojson f = SyntheticUint8();
+			f[Ext("offset")] = i;
+			props[names[i]] = std::move(f);
+			required.push_back(names[i]);
+		}
+		def["properties"] = std::move(props);
+		def["required"] = std::move(required);
+		def[Ext("synthetic")] = true;
+		defs["Color"] = std::move(def);
+	}
+
+	// Color32 is not a named SDK class; emit layout-free.
+	defs["Color32"] = SyntheticObjectHardcoded("Color32", "Packed 32-bit RGBA color (layout-free synthetic; not declared by this name in the HL2SDK).", {
+		{"r", SyntheticUint8()},
+		{"g", SyntheticUint8()},
+		{"b", SyntheticUint8()},
+		{"a", SyntheticUint8()},
+	});
+
+	defs["CTransform"] = SyntheticObject<::CTransform>("CTransform", "Position + rotation transform. SDK members m_vPosition/m_orientation surfaced as position/rotation.", {
+		SYNTHETIC_FIELD_AS(::CTransform, m_vPosition, "position", SerializeRef("VectorAligned")),
+		SYNTHETIC_FIELD_AS(::CTransform, m_orientation, "rotation", SerializeRef("Quaternion")),
+	});
+	defs["AABB_t"] = SyntheticObject<::AABB_t>("AABB_t", "Axis-aligned bounding box. SDK members m_vMinBounds/m_vMaxBounds surfaced as mins/maxs.", {
+		SYNTHETIC_FIELD_AS(::AABB_t, m_vMinBounds, "mins", SerializeRef("Vector")),
+		SYNTHETIC_FIELD_AS(::AABB_t, m_vMaxBounds, "maxs", SerializeRef("Vector")),
+	});
+
+	defs["matrix3x4_t"] = SyntheticFloatArray<::matrix3x4_t>("matrix3x4_t", "3x4 transform matrix (row-major, 12 floats).", 12);
+	defs["matrix3x4a_t"] = SyntheticFloatArray<::matrix3x4a_t>("matrix3x4a_t", "16-byte-aligned 3x4 transform matrix (row-major, 12 floats).", 12);
+
+	// matrix4x4_t is not a named SDK class; emit layout-free.
+	defs["matrix4x4_t"] = SyntheticFloatArrayHardcoded("matrix4x4_t", "4x4 transform matrix (row-major, 16 floats; layout-free synthetic).", 16);
 
 	return defs;
 }
+
+#if defined(__clang__) || defined(__GNUC__)
+#	pragma GCC diagnostic pop
+#endif
+
+#undef SYNTHETIC_FIELD
+#undef SYNTHETIC_FIELD_AS
 
 ojson SerializeClass(const IntermediateSchemaClass& c)
 {
