@@ -156,6 +156,32 @@ static const std::unordered_set<std::string_view> kStringAtomNames = {
 	"CGlobalSymbol",   // global symbol; string-shaped
 };
 
+// Names that arrive from CSchemaSystem as SCHEMA_ATOMIC_PLAIN but should
+// resolve to entries in the synthetic compound type catalogue (BuildSyntheticDefs).
+// CS2 reflection treats math types as opaque atomics rather than declared
+// classes — without this set, every field of type Vector / QAngle / etc. would
+// fall through to the unresolved path and codegens would never see the synthetic
+// $defs we emit.
+//
+// MUST stay aligned with the keys produced by BuildSyntheticDefs(). If you add
+// or remove an entry there, mirror it here.
+static const std::unordered_set<std::string_view> kSyntheticAtomNames = {
+	"Vector",
+	"VectorAligned",
+	"Vector2D",
+	"Vector4D",
+	"QAngle",
+	"Quaternion",
+	"QuaternionStorage", // CS2-only; not in HL2SDK headers — layout-free synthetic
+	"Color",
+	"CTransform",
+	"AABB_t",            // also a declared_class in mathlib_extended; the reflected
+	                     // entry overwrites the synthetic, all refs land on the same $def
+	"matrix3x4_t",
+	"matrix3x4a_t",
+	"VectorWS",          // CS2-only ("Vector World Space"); not in HL2SDK headers
+};
+
 bool IsHandleAtom(std::string_view name)
 {
 	return kHandleAtomNames.find(name) != kHandleAtomNames.end();
@@ -171,6 +197,11 @@ bool IsResourceAtom(std::string_view name)
 	// CResource* family — a small zoo of CResourceName, CResourceNameTyped<>,
 	// CResourceArray<>, etc.; all serialize as a string asset path.
 	return name.rfind("CResource", 0) == 0;
+}
+
+bool IsSyntheticAtom(std::string_view name)
+{
+	return kSyntheticAtomNames.find(name) != kSyntheticAtomNames.end();
 }
 
 ojson SerializeBuiltin(std::string_view name)
@@ -347,6 +378,12 @@ ojson SerializeType(CSchemaType* type)
 				return j;
 			}
 
+			// Synthetic compound types (Vector, QAngle, matrix3x4_t, ...) are
+			// reflected as SCHEMA_ATOMIC_PLAIN — emit a $ref to their entry in
+			// the synthetic catalogue rather than falling through to unresolved.
+			if (IsSyntheticAtom(atomName))
+				return SerializeRef(atomName);
+
 			if (IsStringAtom(atomName) || IsResourceAtom(atomName))
 			{
 				ojson j;
@@ -475,19 +512,6 @@ ojson SyntheticObjectHardcoded(const char* title, const char* description, std::
 	return def;
 }
 
-ojson SyntheticFloatArrayHardcoded(const char* title, const char* description, int count)
-{
-	ojson def;
-	def["type"] = "array";
-	def["title"] = title;
-	def["description"] = description;
-	def["items"] = SyntheticFloat();
-	def["minItems"] = count;
-	def["maxItems"] = count;
-	def[Ext("synthetic")] = true;
-	return def;
-}
-
 #define SYNTHETIC_FIELD(StructT, member, schema) \
 	SyntheticField { #member, offsetof(StructT, member), schema }
 
@@ -535,11 +559,15 @@ ojson BuildSyntheticDefs()
 		SYNTHETIC_FIELD(::Vector4D, z, SyntheticFloat()),
 		SYNTHETIC_FIELD(::Vector4D, w, SyntheticFloat()),
 	});
-	defs["Vector4DAligned"] = SyntheticObject<::Vector4DAligned>("Vector4DAligned", "16-byte-aligned 4D vector.", {
-		SYNTHETIC_FIELD(::Vector4DAligned, x, SyntheticFloat()),
-		SYNTHETIC_FIELD(::Vector4DAligned, y, SyntheticFloat()),
-		SYNTHETIC_FIELD(::Vector4DAligned, z, SyntheticFloat()),
-		SYNTHETIC_FIELD(::Vector4DAligned, w, SyntheticFloat()),
+
+	// VectorWS ("Vector World Space") is referenced in CS2 schemas but not
+	// declared in HL2SDK headers — emit a layout-free synthetic so $refs
+	// resolve. Shape assumed to mirror Vector (3 floats) based on naming
+	// convention; size/offset are not asserted.
+	defs["VectorWS"] = SyntheticObjectHardcoded("VectorWS", "World-space 3D vector. Layout-free synthetic; not declared by this name in HL2SDK.", {
+		{"x", SyntheticFloat()},
+		{"y", SyntheticFloat()},
+		{"z", SyntheticFloat()},
 	});
 	defs["QAngle"] = SyntheticObject<::QAngle>("QAngle", "Euler angles, in degrees. SDK members x/y/z surfaced as pitch/yaw/roll.", {
 		SYNTHETIC_FIELD_AS(::QAngle, x, "pitch", SyntheticFloat()),
@@ -552,11 +580,15 @@ ojson BuildSyntheticDefs()
 		SYNTHETIC_FIELD(::Quaternion, z, SyntheticFloat()),
 		SYNTHETIC_FIELD(::Quaternion, w, SyntheticFloat()),
 	});
-	defs["QuaternionAligned"] = SyntheticObject<::QuaternionAligned>("QuaternionAligned", "16-byte-aligned unit quaternion.", {
-		SYNTHETIC_FIELD(::QuaternionAligned, x, SyntheticFloat()),
-		SYNTHETIC_FIELD(::QuaternionAligned, y, SyntheticFloat()),
-		SYNTHETIC_FIELD(::QuaternionAligned, z, SyntheticFloat()),
-		SYNTHETIC_FIELD(::QuaternionAligned, w, SyntheticFloat()),
+
+	// QuaternionStorage is referenced in CS2 schemas but not declared in
+	// HL2SDK headers — layout-free synthetic. Shape assumed to mirror
+	// Quaternion (4 floats) based on naming convention.
+	defs["QuaternionStorage"] = SyntheticObjectHardcoded("QuaternionStorage", "Quaternion in storage form. Layout-free synthetic; not declared by this name in HL2SDK.", {
+		{"x", SyntheticFloat()},
+		{"y", SyntheticFloat()},
+		{"z", SyntheticFloat()},
+		{"w", SyntheticFloat()},
 	});
 
 	// Color stores 4 channels as `unsigned char _color[4]` (private member),
@@ -584,17 +616,9 @@ ojson BuildSyntheticDefs()
 		defs["Color"] = std::move(def);
 	}
 
-	// Color32 is not a named SDK class; emit layout-free.
-	defs["Color32"] = SyntheticObjectHardcoded("Color32", "Packed 32-bit RGBA color (layout-free synthetic; not declared by this name in the HL2SDK).", {
-		{"r", SyntheticUint8()},
-		{"g", SyntheticUint8()},
-		{"b", SyntheticUint8()},
-		{"a", SyntheticUint8()},
-	});
-
 	defs["CTransform"] = SyntheticObject<::CTransform>("CTransform", "Position + rotation transform. SDK members m_vPosition/m_orientation surfaced as position/rotation.", {
 		SYNTHETIC_FIELD_AS(::CTransform, m_vPosition, "position", SerializeRef("VectorAligned")),
-		SYNTHETIC_FIELD_AS(::CTransform, m_orientation, "rotation", SerializeRef("QuaternionAligned")),
+		SYNTHETIC_FIELD_AS(::CTransform, m_orientation, "rotation", SerializeRef("Quaternion")),
 	});
 	defs["AABB_t"] = SyntheticObject<::AABB_t>("AABB_t", "Axis-aligned bounding box. SDK members m_vMinBounds/m_vMaxBounds surfaced as mins/maxs.", {
 		SYNTHETIC_FIELD_AS(::AABB_t, m_vMinBounds, "mins", SerializeRef("Vector")),
@@ -603,9 +627,6 @@ ojson BuildSyntheticDefs()
 
 	defs["matrix3x4_t"] = SyntheticFloatArray<::matrix3x4_t>("matrix3x4_t", "3x4 transform matrix (row-major, 12 floats).", 12);
 	defs["matrix3x4a_t"] = SyntheticFloatArray<::matrix3x4a_t>("matrix3x4a_t", "16-byte-aligned 3x4 transform matrix (row-major, 12 floats).", 12);
-
-	// matrix4x4_t is not a named SDK class; emit layout-free.
-	defs["matrix4x4_t"] = SyntheticFloatArrayHardcoded("matrix4x4_t", "4x4 transform matrix (row-major, 16 floats; layout-free synthetic).", 16);
 
 	return defs;
 }
