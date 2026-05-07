@@ -19,13 +19,15 @@
 
 #include "json_schema_exporter.h"
 #include "globalvariables.h"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -33,9 +35,6 @@
 using ojson = nlohmann::ordered_json;
 
 namespace Dumpers::Schemas::JsonSchemaExporter
-{
-
-namespace
 {
 
 #if defined(GAME_CS2)
@@ -48,6 +47,9 @@ constexpr const char* kGameToken = "deadlock";
 constexpr const char* kGameToken = "source2";
 #endif
 
+// Per-game JSON Schema extension key prefix (x-cs2-*, x-dota2-*, x-deadlock-*).
+// Other exporters don't emit JSON Schema extension vocabulary, so they don't need
+// a helper like this; we do, so it lives here.
 inline std::string ExtPrefix()
 {
 	return std::string("x-") + kGameToken + "-";
@@ -57,6 +59,12 @@ inline std::string Ext(const char* suffix)
 {
 	return ExtPrefix() + suffix;
 }
+
+// Counts of atom / builtin names we couldn't match to a known dispatch case,
+// reported as a warning summary at the end of Dump(). Mirrors the
+// g_unknownMetadataCounts pattern in filesystem_exporter.cpp.
+static std::map<std::string, int> g_unknownAtomNames;
+static std::map<std::string, int> g_unknownBuiltinNames;
 
 // Strip whitespace inside angle brackets so "CHandle< X >" becomes "CHandle<X>".
 // Whitespace outside <...> is preserved (e.g. "unsigned int").
@@ -86,7 +94,7 @@ std::string NormaliseTypeString(std::string_view in)
 	return out;
 }
 
-// Extract the outer template name: "CHandle<X>" -> "CHandle". For non-templated names returns name unchanged.
+// "CHandle<X>" -> "CHandle"; non-templated names returned unchanged.
 std::string AtomOuterName(std::string_view typeName)
 {
 	auto pos = typeName.find('<');
@@ -112,8 +120,45 @@ ojson SerializeMetadataArray(const std::vector<IntermediateMetadata>& metadataVe
 	return arr;
 }
 
-// Map a builtin name to a JSON Schema fragment. Returns std::nullopt for unrecognised builtins.
-std::optional<ojson> SerializeBuiltin(std::string_view name)
+// Atomic-name dispatch sets. Category alone is sufficient for collections (every
+// SCHEMA_ATOMIC_COLLECTION_OF_T is a JSON array) and for two-arg containers
+// (SCHEMA_ATOMIC_TT). The remaining sets exist only where category + structural
+// fields are not enough to know how to map the atom into JSON Schema vocabulary.
+//
+// Adding a new entry here is a last resort — first prefer a category-based or
+// structural discriminator. Each entry is annotated with WHY it's included so a
+// future maintainer can judge whether a new Valve type belongs in the set.
+static const std::unordered_set<std::string_view> kHandleAtomNames = {
+	"CHandle",       // entity handle — generation-counted ref to networked entity
+	"CWeakHandle",   // weak resource handle, nullable by definition
+	"CStrongHandle", // strong resource handle, also nullable
+};
+
+static const std::unordered_set<std::string_view> kStringAtomNames = {
+	"CUtlSymbolLarge", // symbol-table interned string
+	"CUtlString",      // owning string
+	"CUtlStringToken", // hashed string; serializes as plain string at the schema layer
+	"CGlobalSymbol",   // global symbol; string-shaped
+};
+
+bool IsHandleAtom(std::string_view name)
+{
+	return kHandleAtomNames.find(name) != kHandleAtomNames.end();
+}
+
+bool IsStringAtom(std::string_view name)
+{
+	return kStringAtomNames.find(name) != kStringAtomNames.end();
+}
+
+bool IsResourceAtom(std::string_view name)
+{
+	// CResource* family — a small zoo of CResourceName, CResourceNameTyped<>,
+	// CResourceArray<>, etc.; all serialize as a string asset path.
+	return name.rfind("CResource", 0) == 0;
+}
+
+ojson SerializeBuiltin(std::string_view name)
 {
 	ojson j;
 	if (name == "bool")
@@ -139,38 +184,24 @@ std::optional<ojson> SerializeBuiltin(std::string_view name)
 		j["format"] = "double";
 		return j;
 	}
-	return std::nullopt;
+	// Unknown builtin: emit a permissive schema (no `type` keyword) plus
+	// diagnostic extension keys. JSON Schema treats a missing `type` as
+	// "matches any value", so codegens degrade gracefully rather than
+	// breaking. Tracked for end-of-dump reporting.
+	g_unknownBuiltinNames[std::string(name)]++;
+	j[Ext("unresolved")] = true;
+	j[Ext("builtin-name")] = std::string(name);
+	return j;
 }
 
-bool IsHandleAtom(std::string_view name)
-{
-	return name == "CHandle" || name == "CWeakHandle" || name == "CStrongHandle";
-}
-
-bool IsVectorAtom(std::string_view name)
-{
-	return name == "CUtlVector" || name == "CNetworkUtlVectorBase" || name == "CUtlVectorEmbeddedNetworkVar" || name == "CUtlLeanVector" || name == "CCopyableUtlVector";
-}
-
-bool IsStringAtom(std::string_view name)
-{
-	return name == "CUtlSymbolLarge" || name == "CUtlString" || name == "CUtlStringToken" || name == "CGlobalSymbol";
-}
-
-bool IsResourceAtom(std::string_view name)
-{
-	// "CResource* family" per spec — names beginning with CResource (CResourceName, CResourceNameTyped, etc.).
-	return name.rfind("CResource", 0) == 0;
-}
-
-ojson MakeRef(const std::string& target)
+ojson SerializeRef(const std::string& target)
 {
 	ojson j;
 	j["$ref"] = "#/$defs/" + target;
 	return j;
 }
 
-ojson MakeNullable(ojson inner)
+ojson SerializeNullable(ojson inner)
 {
 	ojson j;
 	ojson nullSchema;
@@ -179,51 +210,50 @@ ojson MakeNullable(ojson inner)
 	return j;
 }
 
-ojson MakeUnresolved()
+ojson SerializeUnresolved()
 {
 	ojson j;
 	j[Ext("unresolved")] = true;
 	return j;
 }
 
-// Returns a type-shape fragment per §5. Field-level annotations (offset, type, metadata) are merged by the caller.
+// Returns a JSON Schema fragment describing the given CSchemaType.
+//
+// Dispatch priority is structural — category first, then category-specific
+// fields — and falls back to a small set of well-known atom names ONLY when
+// the schema-system's category alone can't tell us how to map the atom into
+// JSON Schema vocabulary (e.g. SCHEMA_ATOMIC_T includes both nullable handles
+// and other single-arg wrappers, so a name discriminator is required).
 ojson SerializeType(CSchemaType* type)
 {
 	if (!type)
-		return MakeUnresolved();
+		return SerializeUnresolved();
 
 	const std::string fullName = type->m_sTypeName.String();
 
 	switch (type->m_eTypeCategory)
 	{
 		case SCHEMA_TYPE_BUILTIN:
-		{
-			auto built = SerializeBuiltin(fullName);
-			if (built.has_value())
-				return std::move(*built);
-			ojson j = MakeUnresolved();
-			j[Ext("builtin-name")] = fullName;
-			return j;
-		}
+			return SerializeBuiltin(fullName);
+
 		case SCHEMA_TYPE_DECLARED_CLASS:
 		{
 			auto* declared = static_cast<CSchemaType_DeclaredClass*>(type);
 			if (declared->m_pClassInfo && declared->m_pClassInfo->m_pszName)
-				return MakeRef(declared->m_pClassInfo->m_pszName);
-			return MakeRef(fullName);
+				return SerializeRef(declared->m_pClassInfo->m_pszName);
+			return SerializeRef(fullName);
 		}
 		case SCHEMA_TYPE_DECLARED_ENUM:
 		{
 			auto* declared = static_cast<CSchemaType_DeclaredEnum*>(type);
 			if (declared->m_pEnumInfo && declared->m_pEnumInfo->m_pszName)
-				return MakeRef(declared->m_pEnumInfo->m_pszName);
-			return MakeRef(fullName);
+				return SerializeRef(declared->m_pEnumInfo->m_pszName);
+			return SerializeRef(fullName);
 		}
 		case SCHEMA_TYPE_POINTER:
 		{
 			auto* ptr = static_cast<CSchemaType_Ptr*>(type);
-			ojson inner = SerializeType(ptr->m_pObjectType);
-			ojson j = MakeNullable(std::move(inner));
+			ojson j = SerializeNullable(SerializeType(ptr->m_pObjectType));
 			j[Ext("pointer")] = true;
 			return j;
 		}
@@ -247,14 +277,38 @@ ojson SerializeType(CSchemaType* type)
 		}
 		case SCHEMA_TYPE_ATOMIC:
 		{
+			// Every COLLECTION_OF_T is a JSON array — category is sufficient.
+			if (type->m_eAtomicCategory == SCHEMA_ATOMIC_COLLECTION_OF_T)
+			{
+				auto* tmpl = static_cast<CSchemaType_Atomic_T*>(type);
+				ojson j;
+				j["type"] = "array";
+				j["items"] = SerializeType(tmpl->m_pTemplateType);
+				return j;
+			}
+
+			// Two-template-arg containers (maps, pairs) — category is sufficient.
+			if (type->m_eAtomicCategory == SCHEMA_ATOMIC_TT)
+			{
+				auto* tt = static_cast<CSchemaType_Atomic_TT*>(type);
+				ojson j;
+				j["type"] = "object";
+				j[Ext("template-args")] = ojson::array();
+				j[Ext("template-args")].push_back(tt->m_pTemplateType ? tt->m_pTemplateType->m_sTypeName.String() : "");
+				j[Ext("template-args")].push_back(tt->m_pTemplateType2 ? tt->m_pTemplateType2->m_sTypeName.String() : "");
+				j[Ext("unresolved-template")] = true;
+				return j;
+			}
+
+			// Single-arg atoms: SCHEMA_ATOMIC_T includes both handles and other
+			// wrappers, so we need a name discriminator. Plain atoms (CUtlString
+			// etc.) live in SCHEMA_ATOMIC_PLAIN and also need name discrimination.
 			const std::string atomName = AtomOuterName(fullName);
 
-			// SCHEMA_ATOMIC_T: handles
 			if (type->m_eAtomicCategory == SCHEMA_ATOMIC_T && IsHandleAtom(atomName))
 			{
 				auto* tmpl = static_cast<CSchemaType_Atomic_T*>(type);
-				ojson inner = SerializeType(tmpl->m_pTemplateType);
-				ojson j = MakeNullable(std::move(inner));
+				ojson j = SerializeNullable(SerializeType(tmpl->m_pTemplateType));
 				j[Ext("handle")] = true;
 				if (tmpl->m_pTemplateType)
 				{
@@ -278,17 +332,6 @@ ojson SerializeType(CSchemaType* type)
 				return j;
 			}
 
-			// SCHEMA_ATOMIC_COLLECTION_OF_T: vectors
-			if (type->m_eAtomicCategory == SCHEMA_ATOMIC_COLLECTION_OF_T && IsVectorAtom(atomName))
-			{
-				auto* tmpl = static_cast<CSchemaType_Atomic_T*>(type);
-				ojson j;
-				j["type"] = "array";
-				j["items"] = SerializeType(tmpl->m_pTemplateType);
-				return j;
-			}
-
-			// String-like atoms (SCHEMA_ATOMIC_PLAIN typically) and CResource* family.
 			if (IsStringAtom(atomName) || IsResourceAtom(atomName))
 			{
 				ojson j;
@@ -296,83 +339,120 @@ ojson SerializeType(CSchemaType* type)
 				return j;
 			}
 
-			// SCHEMA_ATOMIC_TT: two-template-arg containers (maps, pairs).
-			if (type->m_eAtomicCategory == SCHEMA_ATOMIC_TT)
-			{
-				auto* tt = static_cast<CSchemaType_Atomic_TT*>(type);
-				ojson j;
-				j["type"] = "object";
-				j[Ext("template-args")] = ojson::array();
-				j[Ext("template-args")].push_back(tt->m_pTemplateType ? tt->m_pTemplateType->m_sTypeName.String() : "");
-				j[Ext("template-args")].push_back(tt->m_pTemplateType2 ? tt->m_pTemplateType2->m_sTypeName.String() : "");
-				j[Ext("unresolved-template")] = true;
-				return j;
-			}
-
-			// Unhandled atom (e.g. unknown SCHEMA_ATOMIC_T name, SCHEMA_ATOMIC_I, SCHEMA_ATOMIC_PLAIN that isn't string/resource).
-			ojson j = MakeUnresolved();
+			// Nothing matched — track the name for the end-of-dump summary.
+			g_unknownAtomNames[atomName]++;
+			ojson j = SerializeUnresolved();
 			j[Ext("atomic-name")] = atomName;
 			return j;
 		}
 		default:
 		{
-			ojson j = MakeUnresolved();
+			ojson j = SerializeUnresolved();
 			j[Ext("type-category")] = static_cast<int>(type->m_eTypeCategory);
 			return j;
 		}
 	}
 }
 
-// Reorder keys per §8: type, title, description, x-* extension keys (alphabetical), allOf, properties, unevaluatedProperties.
-// Any keys not in the list are appended after, in their existing order.
-ojson ReorderKeys(const ojson& in)
+// --- synthetic compound type catalogue ---
+//
+// Source 2's schema reflection does NOT register basic math types
+// (Vector, QAngle, matrix3x4_t, etc.). Fields reference them but they
+// never appear in any CSchemaSystemTypeScope, so $refs to them would
+// dangle. We inject portable JSON Schema definitions for the common
+// ones up front; reflected classes of the same name overwrite the
+// synthetic entry.
+//
+// Field shapes are hardcoded because the HL2SDK doesn't provide any
+// programmatic means to extract ("x", "y", "z") from
+// `class Vector { float x, y, z; }` at compile time without C++
+// reflection. sizeof/offsetof would give us layout numbers but those
+// aren't part of the synthetic shape we emit.
+
+ojson SyntheticFloat()
 {
-	if (!in.is_object())
-		return in;
+	ojson j;
+	j["type"] = "number";
+	j["format"] = "float";
+	return j;
+}
 
-	static const std::vector<std::string> leading{"type", "title", "description"};
-	static const std::vector<std::string> trailing{"allOf", "properties", "unevaluatedProperties"};
+ojson SyntheticUint8()
+{
+	ojson j;
+	j["type"] = "integer";
+	j["format"] = "uint8";
+	return j;
+}
 
-	ojson out = ojson::object();
-
-	for (const auto& key : leading)
+ojson SyntheticObject(const char* title, const char* description, std::initializer_list<std::pair<const char*, ojson>> fields)
+{
+	ojson def;
+	def["type"] = "object";
+	def["title"] = title;
+	def["description"] = description;
+	ojson props = ojson::object();
+	ojson required = ojson::array();
+	for (const auto& [name, schema] : fields)
 	{
-		auto it = in.find(key);
-		if (it != in.end())
-			out[key] = *it;
+		props[name] = schema;
+		required.push_back(name);
 	}
+	def["properties"] = std::move(props);
+	def["required"] = std::move(required);
+	def[Ext("synthetic")] = true;
+	return def;
+}
 
-	std::vector<std::string> xKeys;
-	for (auto it = in.begin(); it != in.end(); ++it)
-	{
-		const std::string& k = it.key();
-		if (k.rfind("x-", 0) == 0)
-			xKeys.push_back(k);
-	}
-	std::sort(xKeys.begin(), xKeys.end());
-	for (const auto& k : xKeys)
-		out[k] = in.at(k);
+ojson SyntheticFloatArray(const char* title, const char* description, int count)
+{
+	ojson def;
+	def["type"] = "array";
+	def["title"] = title;
+	def["description"] = description;
+	def["items"] = SyntheticFloat();
+	def["minItems"] = count;
+	def["maxItems"] = count;
+	def[Ext("synthetic")] = true;
+	return def;
+}
 
-	for (const auto& key : trailing)
-	{
-		auto it = in.find(key);
-		if (it != in.end())
-			out[key] = *it;
-	}
+ojson BuildSyntheticDefs()
+{
+	ojson defs = ojson::object();
 
-	for (auto it = in.begin(); it != in.end(); ++it)
-	{
-		const std::string& k = it.key();
-		if (out.find(k) != out.end())
-			continue;
-		out[k] = it.value();
-	}
+	defs["Vector"] = SyntheticObject("Vector", "3D vector.",
+		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}, {"z", SyntheticFloat()}});
+	defs["VectorAligned"] = SyntheticObject("VectorAligned", "16-byte-aligned 3D vector (memory layout: Vector + padding).",
+		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}, {"z", SyntheticFloat()}});
+	defs["Vector2D"] = SyntheticObject("Vector2D", "2D vector.",
+		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}});
+	defs["Vector4D"] = SyntheticObject("Vector4D", "4D vector.",
+		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}, {"z", SyntheticFloat()}, {"w", SyntheticFloat()}});
+	defs["QAngle"] = SyntheticObject("QAngle", "Euler angles (pitch, yaw, roll), in degrees.",
+		{{"pitch", SyntheticFloat()}, {"yaw", SyntheticFloat()}, {"roll", SyntheticFloat()}});
+	defs["Quaternion"] = SyntheticObject("Quaternion", "Unit quaternion.",
+		{{"x", SyntheticFloat()}, {"y", SyntheticFloat()}, {"z", SyntheticFloat()}, {"w", SyntheticFloat()}});
+	defs["Color"] = SyntheticObject("Color", "RGBA color, 8 bits per channel.",
+		{{"r", SyntheticUint8()}, {"g", SyntheticUint8()}, {"b", SyntheticUint8()}, {"a", SyntheticUint8()}});
+	defs["Color32"] = SyntheticObject("Color32", "Packed 32-bit RGBA color.",
+		{{"r", SyntheticUint8()}, {"g", SyntheticUint8()}, {"b", SyntheticUint8()}, {"a", SyntheticUint8()}});
+	defs["CTransform"] = SyntheticObject("CTransform", "Position + rotation transform.",
+		{{"position", SerializeRef("VectorAligned")}, {"rotation", SerializeRef("Quaternion")}});
+	defs["AABB_t"] = SyntheticObject("AABB_t", "Axis-aligned bounding box.",
+		{{"mins", SerializeRef("Vector")}, {"maxs", SerializeRef("Vector")}});
 
-	return out;
+	defs["matrix3x4_t"] = SyntheticFloatArray("matrix3x4_t", "3x4 transform matrix (row-major, 12 floats).", 12);
+	defs["matrix3x4a_t"] = SyntheticFloatArray("matrix3x4a_t", "16-byte-aligned 3x4 transform matrix (row-major, 12 floats).", 12);
+	defs["matrix4x4_t"] = SyntheticFloatArray("matrix4x4_t", "4x4 transform matrix (row-major, 16 floats).", 16);
+
+	return defs;
 }
 
 ojson SerializeClass(const IntermediateSchemaClass& c)
 {
+	// Insertion order is the publish order; ordered_json preserves it. No
+	// post-hoc reorder pass needed.
 	ojson def;
 	def["type"] = "object";
 	def["title"] = c.name;
@@ -388,7 +468,7 @@ ojson SerializeClass(const IntermediateSchemaClass& c)
 	{
 		ojson allOf = ojson::array();
 		for (const auto& parent : c.parents)
-			allOf.push_back(MakeRef(parent.name));
+			allOf.push_back(SerializeRef(parent.name));
 		def["allOf"] = std::move(allOf);
 	}
 
@@ -404,14 +484,13 @@ ojson SerializeClass(const IntermediateSchemaClass& c)
 			auto fieldMetadata = SerializeMetadataArray(field.metadata);
 			if (!fieldMetadata.empty())
 				fieldSchema[Ext("metadata")] = std::move(fieldMetadata);
-			properties[field.name] = ReorderKeys(fieldSchema);
+			properties[field.name] = std::move(fieldSchema);
 		}
 		def["properties"] = std::move(properties);
 	}
 
 	def["unevaluatedProperties"] = false;
-
-	return ReorderKeys(def);
+	return def;
 }
 
 ojson SerializeEnum(const IntermediateSchemaEnum& e)
@@ -427,17 +506,14 @@ ojson SerializeEnum(const IntermediateSchemaEnum& e)
 	if (e.stringAlignment.has_value())
 	{
 		const std::string& align = *e.stringAlignment;
-		std::optional<std::string> format;
 		if (align == "uint8_t")
-			format = "uint8";
+			def["format"] = "uint8";
 		else if (align == "uint16_t")
-			format = "uint16";
+			def["format"] = "uint16";
 		else if (align == "uint32_t")
-			format = "uint32";
+			def["format"] = "uint32";
 		else if (align == "uint64_t")
-			format = "uint64";
-		if (format.has_value())
-			def["format"] = *format;
+			def["format"] = "uint64";
 	}
 
 	if (!e.members.empty())
@@ -477,181 +553,31 @@ ojson SerializeEnum(const IntermediateSchemaEnum& e)
 	if (!enumMetadata.empty())
 		def[Ext("metadata")] = std::move(enumMetadata);
 
-	return ReorderKeys(def);
+	return def;
 }
 
-ojson BuildSyntheticDefs()
-{
-	// Verbatim from spec appendix A. `required` is preserved as written; do not propagate.
-	const char* kSyntheticJson = R"JSON({
-  "Vector": {
-    "type": "object",
-    "title": "Vector",
-    "description": "3D vector.",
-    "properties": {
-      "x": { "type": "number", "format": "float" },
-      "y": { "type": "number", "format": "float" },
-      "z": { "type": "number", "format": "float" }
-    },
-    "required": ["x", "y", "z"],
-    "x-cs2-synthetic": true
-  },
-  "VectorAligned": {
-    "type": "object",
-    "title": "VectorAligned",
-    "description": "16-byte-aligned 3D vector (memory layout: Vector + padding).",
-    "properties": {
-      "x": { "type": "number", "format": "float" },
-      "y": { "type": "number", "format": "float" },
-      "z": { "type": "number", "format": "float" }
-    },
-    "required": ["x", "y", "z"],
-    "x-cs2-synthetic": true
-  },
-  "Vector2D": {
-    "type": "object",
-    "title": "Vector2D",
-    "description": "2D vector.",
-    "properties": {
-      "x": { "type": "number", "format": "float" },
-      "y": { "type": "number", "format": "float" }
-    },
-    "required": ["x", "y"],
-    "x-cs2-synthetic": true
-  },
-  "Vector4D": {
-    "type": "object",
-    "title": "Vector4D",
-    "description": "4D vector.",
-    "properties": {
-      "x": { "type": "number", "format": "float" },
-      "y": { "type": "number", "format": "float" },
-      "z": { "type": "number", "format": "float" },
-      "w": { "type": "number", "format": "float" }
-    },
-    "required": ["x", "y", "z", "w"],
-    "x-cs2-synthetic": true
-  },
-  "QAngle": {
-    "type": "object",
-    "title": "QAngle",
-    "description": "Euler angles (pitch, yaw, roll), in degrees.",
-    "properties": {
-      "pitch": { "type": "number", "format": "float" },
-      "yaw":   { "type": "number", "format": "float" },
-      "roll":  { "type": "number", "format": "float" }
-    },
-    "required": ["pitch", "yaw", "roll"],
-    "x-cs2-synthetic": true
-  },
-  "Quaternion": {
-    "type": "object",
-    "title": "Quaternion",
-    "description": "Unit quaternion.",
-    "properties": {
-      "x": { "type": "number", "format": "float" },
-      "y": { "type": "number", "format": "float" },
-      "z": { "type": "number", "format": "float" },
-      "w": { "type": "number", "format": "float" }
-    },
-    "required": ["x", "y", "z", "w"],
-    "x-cs2-synthetic": true
-  },
-  "Color": {
-    "type": "object",
-    "title": "Color",
-    "description": "RGBA color, 8 bits per channel.",
-    "properties": {
-      "r": { "type": "integer", "format": "uint8" },
-      "g": { "type": "integer", "format": "uint8" },
-      "b": { "type": "integer", "format": "uint8" },
-      "a": { "type": "integer", "format": "uint8" }
-    },
-    "required": ["r", "g", "b", "a"],
-    "x-cs2-synthetic": true
-  },
-  "Color32": {
-    "type": "object",
-    "title": "Color32",
-    "description": "Packed 32-bit RGBA color.",
-    "properties": {
-      "r": { "type": "integer", "format": "uint8" },
-      "g": { "type": "integer", "format": "uint8" },
-      "b": { "type": "integer", "format": "uint8" },
-      "a": { "type": "integer", "format": "uint8" }
-    },
-    "required": ["r", "g", "b", "a"],
-    "x-cs2-synthetic": true
-  },
-  "CTransform": {
-    "type": "object",
-    "title": "CTransform",
-    "description": "Position + rotation transform.",
-    "properties": {
-      "position": { "$ref": "#/$defs/VectorAligned" },
-      "rotation": { "$ref": "#/$defs/Quaternion" }
-    },
-    "required": ["position", "rotation"],
-    "x-cs2-synthetic": true
-  },
-  "matrix3x4_t": {
-    "type": "array",
-    "title": "matrix3x4_t",
-    "description": "3x4 transform matrix (row-major, 12 floats).",
-    "items": { "type": "number", "format": "float" },
-    "minItems": 12,
-    "maxItems": 12,
-    "x-cs2-synthetic": true
-  },
-  "matrix3x4a_t": {
-    "type": "array",
-    "title": "matrix3x4a_t",
-    "description": "16-byte-aligned 3x4 transform matrix (row-major, 12 floats).",
-    "items": { "type": "number", "format": "float" },
-    "minItems": 12,
-    "maxItems": 12,
-    "x-cs2-synthetic": true
-  },
-  "matrix4x4_t": {
-    "type": "array",
-    "title": "matrix4x4_t",
-    "description": "4x4 transform matrix (row-major, 16 floats).",
-    "items": { "type": "number", "format": "float" },
-    "minItems": 16,
-    "maxItems": 16,
-    "x-cs2-synthetic": true
-  },
-  "AABB_t": {
-    "type": "object",
-    "title": "AABB_t",
-    "description": "Axis-aligned bounding box.",
-    "properties": {
-      "mins": { "$ref": "#/$defs/Vector" },
-      "maxs": { "$ref": "#/$defs/Vector" }
-    },
-    "required": ["mins", "maxs"],
-    "x-cs2-synthetic": true
-  }
-})JSON";
-
-	std::string syntheticJson = kSyntheticJson;
-	const std::string from = "x-cs2-";
-	const std::string to = ExtPrefix();
-	if (from != to)
-	{
-		size_t pos = 0;
-		while ((pos = syntheticJson.find(from, pos)) != std::string::npos)
-		{
-			syntheticJson.replace(pos, from.size(), to);
-			pos += to.size();
-		}
-	}
-	return ojson::parse(syntheticJson);
-}
-
-// Walk every `$ref` in the document and confirm it resolves to a key in `$defs`.
-// Only checks our own emitted refs (fragment of form "#/$defs/<name>").
-// Returns the count of dangling refs found; zero means all good.
+// --- internal $ref-resolution self-check ---
+//
+// REVIEWER NOTE — this block is provisional. Pros / cons:
+//
+//   PROS
+//   - Catches a real bug class: a future change that introduces a new $ref
+//     without a matching $defs entry would silently produce broken output;
+//     this self-check warns at dump time.
+//   - Cheap (single pass; ~ms on a full CS2 dump).
+//   - Adds no new dependency.
+//
+//   CONS
+//   - Other exporters don't have an in-process validation step; this is
+//     unique scope creep relative to filesystem_exporter / json_exporter.
+//   - Soft check (logs only); a CI-time external validator (ajv-cli /
+//     check-jsonschema) is necessary for actual correctness gating
+//     regardless.
+//   - ~35 LOC of unique-pattern code adds review surface.
+//
+// Plan: leave this in during the review cycle to flush out bugs, then
+// REMOVE the function and its call in Dump() before this is marked
+// ready-for-merge.
 int CheckRefs(const ojson& node, const ojson& defs, std::unordered_set<std::string>& reportedMissing)
 {
 	int dangling = 0;
@@ -688,8 +614,6 @@ int CheckRefs(const ojson& node, const ojson& defs, std::unordered_set<std::stri
 	return dangling;
 }
 
-} // anonymous namespace
-
 void Dump(const std::vector<IntermediateSchemaEnum>& enums, const std::vector<IntermediateSchemaClass>& classes)
 {
 	spdlog::info("Dumping schemas to json schema");
@@ -701,6 +625,11 @@ void Dump(const std::vector<IntermediateSchemaEnum>& enums, const std::vector<In
 	root["description"] = std::string("JSON Schema describing every entity reflected by DumpSource2 from ") + kGameToken + ". Inheritance is preserved via allOf+$ref. Game-specific information is preserved under " + ExtPrefix() + "* extension keywords.";
 
 	root[Ext("generator")] = "https://github.com/ValveResourceFormat/DumpSource2";
+
+	// std::stoi can throw on a malformed revision string. json_exporter.cpp
+	// invokes it bare; we wrap it here so a malformed steam.inf can't take
+	// this exporter down independently of the existing one. Happy to drop
+	// the try/catch for consistency with json_exporter if reviewers prefer.
 	if (!Globals::sourceRevision.empty())
 	{
 		try
@@ -717,30 +646,30 @@ void Dump(const std::vector<IntermediateSchemaEnum>& enums, const std::vector<In
 	if (!Globals::versionTime.empty())
 		root[Ext("version-time")] = Globals::versionTime;
 
-	// $defs starts with synthetic primitives; reflected entities can overwrite.
+	// Synthetic primitives go in first; reflected entities of the same name overwrite.
 	ojson defs = BuildSyntheticDefs();
-
 	for (const auto& c : classes)
 		defs[c.name] = SerializeClass(c);
-
 	for (const auto& e : enums)
 		defs[e.name] = SerializeEnum(e);
-
 	root["$defs"] = std::move(defs);
 
+	// Self-check (provisional, see CheckRefs comment above).
 	std::unordered_set<std::string> reportedMissing;
 	const int dangling = CheckRefs(root, root["$defs"], reportedMissing);
 	if (dangling > 0)
-	{
-		spdlog::error("schemas_jsonschema.json self-validation failed: {} dangling $ref(s) (across {} unique target(s))", dangling, reportedMissing.size());
-	}
+		spdlog::error("schemas_jsonschema.json self-validation: {} dangling $ref(s) (across {} unique target(s))", dangling, reportedMissing.size());
 
-	const auto outPath = Globals::outputPath / "schemas_jsonschema.json";
-	std::ofstream output(outPath);
+	std::ofstream output(Globals::outputPath / "schemas_jsonschema.json");
 	output << root.dump(2) << "\n";
 	output.close();
 
-	spdlog::info("Wrote {} ({} classes, {} enums, {} $defs entries)", outPath.generic_string(), classes.size(), enums.size(), root["$defs"].size());
+	for (const auto& [name, count] : g_unknownAtomNames)
+		spdlog::warn("Atomic '{}' fell through to unresolved ({} usages)", name, count);
+	for (const auto& [name, count] : g_unknownBuiltinNames)
+		spdlog::warn("Builtin '{}' fell through to permissive schema ({} usages)", name, count);
+
+	spdlog::info("Wrote schemas_jsonschema.json ({} classes, {} enums)", classes.size(), enums.size());
 }
 
 } // namespace Dumpers::Schemas::JsonSchemaExporter
