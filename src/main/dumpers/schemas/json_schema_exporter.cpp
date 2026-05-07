@@ -776,9 +776,6 @@ ojson SerializeEnum(const IntermediateSchemaEnum& e)
 //     regardless.
 //   - ~35 LOC of unique-pattern code adds review surface.
 //
-// Plan: leave this in during the review cycle to flush out bugs, then
-// REMOVE the function and its call in Dump() before this is marked
-// ready-for-merge.
 int CheckRefs(const ojson& node, const ojson& defs, std::unordered_set<std::string>& reportedMissing)
 {
 	int dangling = 0;
