@@ -81,29 +81,34 @@ inline std::string Ext(const char* suffix)
 static std::map<std::string, int> g_unknownAtomNames;
 static std::map<std::string, int> g_unknownBuiltinNames;
 
-// Strip whitespace inside angle brackets so "CHandle< X >" becomes "CHandle<X>".
-// Whitespace outside <...> is preserved (e.g. "unsigned int").
-std::string NormaliseTypeString(std::string_view in)
+// Strip whitespace inside angle brackets so type-name strings produced by the
+// SDK round-trip into a canonical form. Whitespace outside <...> is preserved.
+//
+//   "CHandle< X >"             -> "CHandle<X>"
+//   "CFoo< CBar< int > >"      -> "CFoo<CBar<int>>"     (nested templates)
+//   "unsigned int"             -> "unsigned int"        (no <>; preserved)
+//   "CFoo<X>>"                 -> "CFoo<X>>"            (malformed; passed through)
+//
+// Only U+0020 SPACE and U+0009 TAB are stripped — newlines/CRs are left as-is
+// because we don't expect them in SDK type names and stripping them silently
+// would mask actual corruption.
+std::string NormalizeTypeString(std::string_view in)
 {
 	std::string out;
 	out.reserve(in.size());
 	int depth = 0;
 	for (char c : in)
 	{
+		const bool insideTemplate = depth > 0;
+		const bool stripChar = insideTemplate && (c == ' ' || c == '\t');
+		if (stripChar)
+			continue;
+
 		if (c == '<')
-		{
-			depth++;
-			out.push_back(c);
-			continue;
-		}
-		if (c == '>')
-		{
-			depth--;
-			out.push_back(c);
-			continue;
-		}
-		if (depth > 0 && (c == ' ' || c == '\t'))
-			continue;
+			++depth;
+		else if (c == '>' && depth > 0)
+			--depth;
+
 		out.push_back(c);
 	}
 	return out;
@@ -676,7 +681,7 @@ ojson SerializeClass(const IntermediateSchemaClass& c)
 			ojson fieldSchema = SerializeType(field.type);
 			fieldSchema[Ext("offset")] = field.offset;
 			if (field.type)
-				fieldSchema[Ext("type")] = NormaliseTypeString(field.type->m_sTypeName.String());
+				fieldSchema[Ext("type")] = NormalizeTypeString(field.type->m_sTypeName.String());
 			auto fieldMetadata = SerializeMetadataArray(field.metadata);
 			if (!fieldMetadata.empty())
 				fieldSchema[Ext("metadata")] = std::move(fieldMetadata);
@@ -754,7 +759,7 @@ ojson SerializeEnum(const IntermediateSchemaEnum& e)
 
 // --- internal $ref-resolution self-check ---
 //
-// REVIEWER NOTE — this block is provisional. Pros / cons:
+// REVIEWER NOTE — this block is for context during review and will be removed before merging.
 //
 //   PROS
 //   - Catches a real bug class: a future change that introduces a new $ref
