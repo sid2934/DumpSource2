@@ -12,6 +12,15 @@ Run DumpSource2 from the rootbin folder of a source 2 game. `game/bin/win64`
 
 - `output path` - absolute or relative path to a folder where output should be stored
 
+## Output
+
+- `schemas/` - per-module `.h` text dump of every reflected class and enum
+- `schemas.json` - structured dump of every reflected class and enum
+- `schemas_jsonschema.json` - JSON Schema 2020-12 description of every reflected entity, suitable for code generators (NJsonSchema, quicktype, json-schema-to-typescript, ...)
+- `convars.txt` - dump of registered convars and concommands
+- `module_metadata.json` - per-module metadata (build strings, etc.)
+- `.stringsignore` - list of names emitted by the dumpers, used by GameTracking to skip diff noise
+
 
 # Compilation
 

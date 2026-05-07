@@ -27,6 +27,7 @@
 #undef private
 #include "filesystem_exporter.h"
 #include "json_exporter.h"
+#include "json_schema_exporter.h"
 
 namespace Dumpers::Schemas
 {
@@ -178,6 +179,7 @@ void Dump()
 
 	FilesystemExporter::Dump(enums, classes);
 	JsonExporter::Dump(enums, classes);
+	JsonSchemaExporter::Dump(enums, classes);
 }
 
 } // namespace Dumpers::Schemas
