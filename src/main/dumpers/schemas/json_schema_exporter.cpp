@@ -166,41 +166,27 @@ static const std::unordered_set<std::string_view> kStringAtomNames = {
 // MUST stay aligned with the keys produced by BuildSyntheticDefs(). If you add
 // or remove an entry there, mirror it here (and vice versa).
 //
-// Per-game divergence: the common block holds names empirically known or
-// strongly presumed to apply across Source 2 games (canonical Valve math
-// primitives). Game-specific entries go inside their own #if defined(GAME_*)
-// guard with a comment naming the empirical source. To add a new game target,
-// sample its real reflection output (e.g. SchemaExplorer's <game>.json.gz)
-// and add any game-specific entries under the matching guard below.
+// Single list across all game targets: an entry that appears here but isn't
+// actually referenced by a particular game's reflection output is just an
+// unused $defs entry in the artifact — harmless bytes. The opposite mistake
+// (a name that's referenced but missing from the set) silently produces
+// broken output via fallthrough to unresolved. So we err toward inclusion
+// rather than per-game guards.
 static const std::unordered_set<std::string_view> kSyntheticAtomNames = {
-	// Common across all Source 2 games (verified for CS2; presumed for DOTA / DEADLOCK).
 	"Vector",
 	"VectorAligned",
 	"Vector2D",
 	"Vector4D",
+	"VectorWS",          // CS2-evidenced (59 refs in cs2.json); "Vector World Space"; not in HL2SDK
 	"QAngle",
 	"Quaternion",
+	"QuaternionStorage", // CS2-evidenced (8 refs in cs2.json); storage form of a quaternion; not in HL2SDK
 	"Color",
 	"CTransform",
-	"AABB_t",       // also a declared_class in mathlib_extended; the reflected
-	                // entry overwrites the synthetic, all refs land on the same $def
+	"AABB_t",            // also a declared_class in mathlib_extended; the reflected
+	                     // entry overwrites the synthetic, all refs land on the same $def
 	"matrix3x4_t",
 	"matrix3x4a_t",
-
-#if defined(GAME_CS2)
-	// CS2-specific: confirmed by inspecting cs2.json from
-	// ValveResourceFormat/SchemaExplorer (DumpSource2 reflection of CS2).
-	"VectorWS",          // 59 references; "Vector World Space"; not in HL2SDK headers
-	"QuaternionStorage", // 8 references; storage form of a quaternion; not in HL2SDK
-#endif
-
-#if defined(GAME_DOTA)
-	// DOTA-specific entries TBD — reflection-sample dota2.json to populate.
-#endif
-
-#if defined(GAME_DEADLOCK)
-	// DEADLOCK-specific entries TBD — reflection-sample deadlock.json to populate.
-#endif
 };
 
 bool IsHandleAtom(std::string_view name)
@@ -581,7 +567,6 @@ ojson BuildSyntheticDefs()
 		SYNTHETIC_FIELD(::Vector4D, w, SyntheticFloat()),
 	});
 
-#if defined(GAME_CS2)
 	// VectorWS ("Vector World Space") is referenced in CS2 schemas but not
 	// declared in HL2SDK headers — emit a layout-free synthetic so $refs
 	// resolve. Shape assumed to mirror Vector (3 floats) based on naming
@@ -591,7 +576,6 @@ ojson BuildSyntheticDefs()
 		{"y", SyntheticFloat()},
 		{"z", SyntheticFloat()},
 	});
-#endif
 	defs["QAngle"] = SyntheticObject<::QAngle>("QAngle", "Euler angles, in degrees. SDK members x/y/z surfaced as pitch/yaw/roll.", {
 		SYNTHETIC_FIELD_AS(::QAngle, x, "pitch", SyntheticFloat()),
 		SYNTHETIC_FIELD_AS(::QAngle, y, "yaw", SyntheticFloat()),
@@ -604,7 +588,6 @@ ojson BuildSyntheticDefs()
 		SYNTHETIC_FIELD(::Quaternion, w, SyntheticFloat()),
 	});
 
-#if defined(GAME_CS2)
 	// QuaternionStorage is referenced in CS2 schemas but not declared in
 	// HL2SDK headers — layout-free synthetic. Shape assumed to mirror
 	// Quaternion (4 floats) based on naming convention.
@@ -614,7 +597,6 @@ ojson BuildSyntheticDefs()
 		{"z", SyntheticFloat()},
 		{"w", SyntheticFloat()},
 	});
-#endif
 
 	// Color stores 4 channels as `unsigned char _color[4]` (private member),
 	// so we can't take offsetof on _color from outside. The bytes are at
