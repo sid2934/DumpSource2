@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\dev\\\\DumpSource2\" -Force)",
+      "Bash(Select-Object Name, PSIsContainer)",
+      "Bash(Format-Table -AutoSize)",
+      "Bash(python3 *)",
+      "WebSearch",
+      "Bash(node *)",
+      "Bash(dotnet build *)",
+      "Bash(dotnet run *)",
+      "Bash(xargs grep -l \"CHandle\\\\|CWeakHandle\\\\|CStrongHandle\")"
+    ]
+  }
+}

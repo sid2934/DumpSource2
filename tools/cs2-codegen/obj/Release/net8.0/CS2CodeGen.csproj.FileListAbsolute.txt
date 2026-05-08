@@ -1,0 +1,15 @@
+C:\dev\DumpSource2\tools\cs2-codegen\bin\Release\net8.0\cs2-codegen.exe
+C:\dev\DumpSource2\tools\cs2-codegen\bin\Release\net8.0\cs2-codegen.deps.json
+C:\dev\DumpSource2\tools\cs2-codegen\bin\Release\net8.0\cs2-codegen.runtimeconfig.json
+C:\dev\DumpSource2\tools\cs2-codegen\bin\Release\net8.0\cs2-codegen.dll
+C:\dev\DumpSource2\tools\cs2-codegen\bin\Release\net8.0\cs2-codegen.pdb
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\CS2CodeGen.GeneratedMSBuildEditorConfig.editorconfig
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\CS2CodeGen.AssemblyInfoInputs.cache
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\CS2CodeGen.AssemblyInfo.cs
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\CS2CodeGen.csproj.CoreCompileInputs.cache
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\CS2CodeGen.sourcelink.json
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\cs2-codegen.dll
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\refint\cs2-codegen.dll
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\cs2-codegen.pdb
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\CS2CodeGen.genruntimeconfig.cache
+C:\dev\DumpSource2\tools\cs2-codegen\obj\Release\net8.0\ref\cs2-codegen.dll

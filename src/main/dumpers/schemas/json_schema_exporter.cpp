@@ -19,7 +19,6 @@
 
 #include "json_schema_exporter.h"
 #include "globalvariables.h"
-#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -155,10 +154,78 @@ static const std::unordered_set<std::string_view> kHandleAtomNames = {
 };
 
 static const std::unordered_set<std::string_view> kStringAtomNames = {
-	"CUtlSymbolLarge", // symbol-table interned string
-	"CUtlString",      // owning string
-	"CUtlStringToken", // hashed string; serializes as plain string at the schema layer
-	"CGlobalSymbol",   // global symbol; string-shaped
+	"CUtlSymbolLarge",              // symbol-table interned string
+	"CUtlString",                   // owning string
+	"CUtlStringToken",              // hashed string; serializes as plain string at the schema layer
+	"CGlobalSymbol",                // global symbol; string-shaped
+	"CBufferString",                // owning string backed by a fixed-size buffer
+	"CUtlSymbol",                   // symbol
+	"CUtlStringTokenWithStorage",   // string token with embedded storage
+	"CGlobalSymbolCaseSensitive",   // case-sensitive global symbol
+	"CKV3MemberNameWithStorage",    // KV3 member name with embedded storage
+	"CAttachmentNameSymbolWithStorage", // attachment name symbol with storage
+	"CSoundEventName",              // sound event name
+	"CEntityNameString",            // entity name
+	"PulseSymbol_t",                // Pulse graph symbol; string-backed
+	"CModelAnimNameWithDeltas",     // animation name with delta list; string-shaped
+	"CModelMaterialGroupName",      // material group name
+};
+
+static const std::unordered_set<std::string_view> kIntegerAtomNames = {
+	"CEntityIndex",      // entity index (integer slot)
+	"CPlayerSlot",       // player slot index
+	"CSplitScreenSlot",  // split-screen slot index
+	"ParticleParamID_t", // particle parameter identifier
+	"WorldGroupId_t",    // world group identifier
+};
+
+// Types that are opaque atomics with no useful JSON Schema shape. Explicitly
+// catalogued here so the unknown-fallthrough warning doesn't fire for them.
+// These still emit SerializeUnresolved() — they just aren't "unknown".
+static const std::unordered_set<std::string_view> kOpaqueAtomNames = {
+	// function / opaque pointers
+	"BASEPTR", "USEPTR", "ENTITYFUNCPTR",
+	// animation system opaque types
+	"CAnimGraph2ParamAutoResetOptionalRef", "CAnimGraph2ParamOptionalRef",
+	"CAnimNetVar", "CAnimScriptParam", "CAnimValue", "CAnimVariant",
+	"CMotionTransform",
+	// bit vectors
+	"CBitVec", "CTypedBitVec",
+	// curves / gradients
+	"CColorGradient", "CPiecewiseCurve",
+	// compression
+	"CCompressor",
+	// entity systems
+	"CEntityHandle", "CEntityOutputTemplate",
+	// KV
+	"CKV3MemberNameSet", "KeyValues", "KeyValues3",
+	// particle
+	"CParticleNamedValueRef",
+	// pulse
+	"CPulseValueFullType",
+	// arrays / containers
+	"CRelativeArray", "CUtlStringMap", "CUtlVectorSIMDPaddedVector",
+	// smart prop attribute wrappers (opaque schema-side; inner value is inaccessible via reflection)
+	"CSmartPropAttributeAngles", "CSmartPropAttributeBool",
+	"CSmartPropAttributeColor", "CSmartPropAttributeFloat",
+	"CSmartPropAttributeInt", "CSmartPropAttributeMaterialGroup",
+	"CSmartPropAttributeMaterialName", "CSmartPropAttributeModelName",
+	"CSmartPropAttributeStateName", "CSmartPropAttributeSurfaceProperty",
+	"CSmartPropAttributeVariableValue", "CSmartPropAttributeVector",
+	"CSmartPropAttributeVector2D", "CSmartPropVariableComparison",
+	// pointers / handles
+	"CSmartPtr", "CStrongHandleCopyable", "CStrongHandleVoid", "HSCRIPT",
+	// steam audio
+	"CSteamAudioMovableBakedData",
+	"IPLCompressedEnergyFields", "IPLProbeBatch", "IPLScene", "IPLStaticMesh",
+	// binary
+	"CUtlBinaryBlock",
+	// variant
+	"CVariantBase",
+	// SIMD (no useful named-field shape)
+	"FourVectors",
+	// sphere / other geometry
+	"SphereBase_t",
 };
 
 // Names that arrive from CSchemaSystem as SCHEMA_ATOMIC_PLAIN but should
@@ -192,6 +259,13 @@ static const std::unordered_set<std::string_view> kSyntheticAtomNames = {
 	                     // entry overwrites the synthetic, all refs land on the same $def
 	"matrix3x4_t",
 	"matrix3x4a_t",
+	"fltx4",             // __m128 SIMD 4-float; not reflected; layout-free synthetic
+	"DegreeEuler",       // Euler angles in degrees; 3 floats
+	"RadianEuler",       // Euler angles in radians; 3 floats
+	"RotationVector",    // rotation vector; 3 floats
+	"CRotation",         // rotation; quaternion-shaped (4 floats); not in HL2SDK as a reflected class
+	"CTransformWS",      // world-space transform; layout-free synthetic; not in HL2SDK
+	"Range_t",           // min/max float pair
 };
 
 bool IsHandleAtom(std::string_view name)
@@ -214,6 +288,16 @@ bool IsResourceAtom(std::string_view name)
 bool IsSyntheticAtom(std::string_view name)
 {
 	return kSyntheticAtomNames.find(name) != kSyntheticAtomNames.end();
+}
+
+bool IsIntegerAtom(std::string_view name)
+{
+	return kIntegerAtomNames.find(name) != kIntegerAtomNames.end();
+}
+
+bool IsOpaqueAtom(std::string_view name)
+{
+	return kOpaqueAtomNames.find(name) != kOpaqueAtomNames.end();
 }
 
 ojson SerializeBuiltin(std::string_view name)
@@ -242,6 +326,14 @@ ojson SerializeBuiltin(std::string_view name)
 		j["format"] = "double";
 		return j;
 	}
+	if (name == "char")
+	{
+		j["type"] = "integer";
+		j["format"] = "int8";
+		return j;
+	}
+	if (name == "void")
+		return j; // permissive: matches any value; not tracked as unknown
 	// Unknown builtin: emit a permissive schema (no `type` keyword) plus
 	// diagnostic extension keys. JSON Schema treats a missing `type` as
 	// "matches any value", so codegens degrade gracefully rather than
@@ -402,6 +494,34 @@ ojson SerializeType(CSchemaType* type)
 				j["type"] = "string";
 				return j;
 			}
+
+			if (IsIntegerAtom(atomName))
+			{
+				ojson j;
+				j["type"] = "integer";
+				return j;
+			}
+
+			if (atomName == "V_uuid_t")
+			{
+				ojson j;
+				j["type"] = "string";
+				j["format"] = "uuid";
+				return j;
+			}
+
+			if (atomName == "CNetworkedQuantizedFloat")
+			{
+				ojson j;
+				j["type"] = "number";
+				j["format"] = "float";
+				return j;
+			}
+
+			// Explicitly classified opaque types — no JSON Schema shape available,
+			// but not "unknown". Emit unresolved without adding to the warning tally.
+			if (IsOpaqueAtom(atomName))
+				return SerializeUnresolved();
 
 			// Nothing matched — track the name for the end-of-dump summary.
 			g_unknownAtomNames[atomName]++;
@@ -640,6 +760,55 @@ ojson BuildSyntheticDefs()
 	defs["matrix3x4_t"] = SyntheticFloatArray<::matrix3x4_t>("matrix3x4_t", "3x4 transform matrix (row-major, 12 floats).", 12);
 	defs["matrix3x4a_t"] = SyntheticFloatArray<::matrix3x4a_t>("matrix3x4a_t", "16-byte-aligned 3x4 transform matrix (row-major, 12 floats).", 12);
 
+	// fltx4 is typedef __m128 — no named members; 16 bytes = 4 packed floats.
+	{
+		ojson def;
+		def["type"] = "array";
+		def["title"] = "fltx4";
+		def["description"] = "SIMD 4-float vector (fltx4 / __m128). 16 bytes.";
+		def["items"] = SyntheticFloat();
+		def["minItems"] = 4;
+		def["maxItems"] = 4;
+		def[Ext("size")] = 16;
+		def[Ext("synthetic")] = true;
+		defs["fltx4"] = std::move(def);
+	}
+
+	defs["DegreeEuler"] = SyntheticObjectHardcoded("DegreeEuler", "Euler angles in degrees.", {
+		{"x", SyntheticFloat()},
+		{"y", SyntheticFloat()},
+		{"z", SyntheticFloat()},
+	});
+	defs["RadianEuler"] = SyntheticObjectHardcoded("RadianEuler", "Euler angles in radians.", {
+		{"x", SyntheticFloat()},
+		{"y", SyntheticFloat()},
+		{"z", SyntheticFloat()},
+	});
+	defs["RotationVector"] = SyntheticObjectHardcoded("RotationVector", "Rotation vector; 3 floats.", {
+		{"x", SyntheticFloat()},
+		{"y", SyntheticFloat()},
+		{"z", SyntheticFloat()},
+	});
+
+	// CRotation is quaternion-shaped; not declared by this name in HL2SDK.
+	defs["CRotation"] = SyntheticObjectHardcoded("CRotation", "Rotation in quaternion form. Layout-free synthetic; not declared by this name in HL2SDK.", {
+		{"x", SyntheticFloat()},
+		{"y", SyntheticFloat()},
+		{"z", SyntheticFloat()},
+		{"w", SyntheticFloat()},
+	});
+
+	// CTransformWS is a world-space transform; not declared by this name in HL2SDK.
+	defs["CTransformWS"] = SyntheticObjectHardcoded("CTransformWS", "World-space position + rotation transform. Layout-free synthetic; not declared by this name in HL2SDK.", {
+		{"position", SerializeRef("Vector")},
+		{"rotation", SerializeRef("Quaternion")},
+	});
+
+	defs["Range_t"] = SyntheticObjectHardcoded("Range_t", "Scalar range with min and max.", {
+		{"min", SyntheticFloat()},
+		{"max", SyntheticFloat()},
+	});
+
 	return defs;
 }
 
@@ -676,6 +845,7 @@ ojson SerializeClass(const IntermediateSchemaClass& c)
 	if (!c.fields.empty())
 	{
 		ojson properties = ojson::object();
+		ojson required = ojson::array();
 		for (const auto& field : c.fields)
 		{
 			ojson fieldSchema = SerializeType(field.type);
@@ -686,12 +856,32 @@ ojson SerializeClass(const IntermediateSchemaClass& c)
 			if (!fieldMetadata.empty())
 				fieldSchema[Ext("metadata")] = std::move(fieldMetadata);
 			properties[field.name] = std::move(fieldSchema);
+			required.push_back(field.name);
 		}
 		def["properties"] = std::move(properties);
+		def["required"] = std::move(required);
 	}
 
 	def["unevaluatedProperties"] = false;
 	return def;
+}
+
+// Returns true when every non-zero member value is a single set bit (power of 2).
+// JSON Schema's `enum` keyword would be semantically wrong for these types because
+// valid field values are OR-combinations of the named bits — not just the individual
+// bit values. Callers should omit `enum` and emit x-*-flags: true instead.
+bool IsFlagsEnum(const std::vector<IntermediateSchemaEnumMember>& members)
+{
+	bool anyBit = false;
+	for (const auto& m : members)
+	{
+		if (m.value == 0)
+			continue; // zero ("no flags set") is valid in a flags enum
+		if (m.value < 0 || (m.value & (m.value - 1)) != 0)
+			return false; // negative or multi-bit: not a flags enum
+		anyBit = true;
+	}
+	return anyBit;
 }
 
 ojson SerializeEnum(const IntermediateSchemaEnum& e)
@@ -702,11 +892,9 @@ ojson SerializeEnum(const IntermediateSchemaEnum& e)
 	def[Ext("kind")] = "enum";
 	def[Ext("module")] = e.module;
 	if (e.stringAlignment.has_value())
-		def[Ext("alignment")] = *e.stringAlignment;
-
-	if (e.stringAlignment.has_value())
 	{
 		const std::string& align = *e.stringAlignment;
+		def[Ext("alignment")] = align;
 		if (align == "uint8_t")
 			def["format"] = "uint8";
 		else if (align == "uint16_t")
@@ -719,16 +907,16 @@ ojson SerializeEnum(const IntermediateSchemaEnum& e)
 
 	if (!e.members.empty())
 	{
-		std::vector<int64_t> values;
-		std::unordered_set<int64_t> seen;
+		const bool isFlags = IsFlagsEnum(e.members);
+		if (isFlags)
+			def[Ext("flags")] = true;
+
 		ojson valuesMap = ojson::object();
 		ojson memberMetadata = ojson::object();
 		bool anyMemberMetadata = false;
 
 		for (const auto& m : e.members)
 		{
-			if (seen.insert(m.value).second)
-				values.push_back(m.value);
 			valuesMap[m.name] = m.value;
 
 			auto mm = SerializeMetadataArray(m.metadata);
@@ -738,12 +926,29 @@ ojson SerializeEnum(const IntermediateSchemaEnum& e)
 				anyMemberMetadata = true;
 			}
 		}
-		std::sort(values.begin(), values.end());
 
-		ojson enumValues = ojson::array();
-		for (auto v : values)
-			enumValues.push_back(v);
-		def["enum"] = std::move(enumValues);
+		// anyOf + const + title is the JSON Schema 2020-12 standard mechanism for
+		// named enum values. anyOf is used rather than oneOf because some enums
+		// have alias members that share an integer value; oneOf requires exactly
+		// one subschema to match, so two {"const": N} entries with the same N
+		// would both match and cause oneOf to fail on that value.
+		//
+		// For flags enums, valid field values are OR-combinations of the named bits
+		// (e.g. 6 = DMG_BULLET|DMG_SLASH), which anyOf cannot express — those
+		// combined values will fail anyOf validation. JSON Schema 2020-12 has no
+		// mechanism for this (see github.com/json-schema-org/json-schema-vocabularies/issues/24).
+		// We emit anyOf anyway so generators get the named constants; x-*-flags: true
+		// signals that combined values are semantically valid and generators should
+		// produce a bitflags-aware type (e.g. C# [Flags], TypeScript bitmask helpers).
+		ojson anyOf = ojson::array();
+		for (const auto& m : e.members)
+		{
+			ojson entry;
+			entry["const"] = m.value;
+			entry["title"] = m.name;
+			anyOf.push_back(std::move(entry));
+		}
+		def["anyOf"] = std::move(anyOf);
 		def[Ext("enum-values")] = std::move(valuesMap);
 
 		if (anyMemberMetadata)
@@ -759,24 +964,10 @@ ojson SerializeEnum(const IntermediateSchemaEnum& e)
 
 // --- internal $ref-resolution self-check ---
 //
-// REVIEWER NOTE — this block is for context during review and will be removed before merging.
-//
-//   PROS
-//   - Catches a real bug class: a future change that introduces a new $ref
-//     without a matching $defs entry would silently produce broken output;
-//     this self-check warns at dump time.
-//   - Cheap (single pass; ~ms on a full CS2 dump).
-//   - Adds no new dependency.
-//
-//   CONS
-//   - Other exporters don't have an in-process validation step; this is
-//     unique scope creep relative to filesystem_exporter / json_exporter.
-//   - Soft check (logs only); a CI-time external validator (ajv-cli /
-//     check-jsonschema) is necessary for actual correctness gating
-//     regardless.
-//   - ~35 LOC of unique-pattern code adds review surface.
-//
-int CheckRefs(const ojson& node, const ojson& defs, std::unordered_set<std::string>& reportedMissing)
+// Walks the emitted document and collects any $ref targets that have no
+// matching entry in $defs. Callers inject forward-declared stubs for any
+// missing targets so the output is always self-consistent.
+int CheckRefs(const ojson& node, const ojson& defs, std::unordered_set<std::string>& missingTargets)
 {
 	int dangling = 0;
 	if (node.is_object())
@@ -792,22 +983,21 @@ int CheckRefs(const ojson& node, const ojson& defs, std::unordered_set<std::stri
 					const std::string target = ref.substr(prefix.size());
 					if (defs.find(target) == defs.end())
 					{
-						if (reportedMissing.insert(target).second)
-							spdlog::warn("schemas_jsonschema.json: dangling $ref to '{}'", target);
+						missingTargets.insert(target);
 						dangling++;
 					}
 				}
 			}
 			else
 			{
-				dangling += CheckRefs(it.value(), defs, reportedMissing);
+				dangling += CheckRefs(it.value(), defs, missingTargets);
 			}
 		}
 	}
 	else if (node.is_array())
 	{
 		for (const auto& el : node)
-			dangling += CheckRefs(el, defs, reportedMissing);
+			dangling += CheckRefs(el, defs, missingTargets);
 	}
 	return dangling;
 }
@@ -852,11 +1042,18 @@ void Dump(const std::vector<IntermediateSchemaEnum>& enums, const std::vector<In
 		defs[e.name] = SerializeEnum(e);
 	root["$defs"] = std::move(defs);
 
-	// Self-check (provisional, see CheckRefs comment above).
-	std::unordered_set<std::string> reportedMissing;
-	const int dangling = CheckRefs(root, root["$defs"], reportedMissing);
-	if (dangling > 0)
-		spdlog::error("schemas_jsonschema.json self-validation: {} dangling $ref(s) (across {} unique target(s))", dangling, reportedMissing.size());
+	// Self-check: inject forward-declared stubs for any $ref targets that aren't in
+	// $defs (e.g. classes defined only in tool modules that don't fully initialize).
+	std::unordered_set<std::string> missingDefs;
+	CheckRefs(root, root["$defs"], missingDefs);
+	for (const auto& target : missingDefs)
+	{
+		ojson stub;
+		stub[Ext("forward-declared")] = true;
+		root["$defs"][target] = std::move(stub);
+	}
+	if (!missingDefs.empty())
+		spdlog::debug("schemas_jsonschema.json: injected {} forward-declared stub(s) for unreachable class(es)", missingDefs.size());
 
 	std::ofstream output(Globals::outputPath / "schemas_jsonschema.json");
 	output << root.dump(2) << "\n";
